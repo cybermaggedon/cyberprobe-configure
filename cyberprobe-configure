@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+
+import requests
+import base64
+from OpenSSL import crypto
+import xml.dom.minidom
+import sys
+import time
+import json
+
+if len(sys.argv) > 1:
+    configfile = sys.argv[1]
+else:
+    configfile = "/etc/cyberprobe/cyberprobe-configure.cfg"
+
+try:
+     with open(configfile, "r") as f:
+          config = json.loads(f.read())
+     pkey = config["key"]
+
+     # pkey may be a file or a literal key string.  Work it out...
+     try:
+         file = pkey
+         pkey = open(file).read().strip()
+         print("Key read from file", file)
+
+     except:
+         pass
+
+     cyberprobe = config["configfile"]
+     url = config["url"] + pkey
+     try:
+          client_verify = config["client_verify"]
+     except:
+          client_verify = True
+except Exception as e:
+     print("Reading config %s: %s", configfile, e)
+     sys.exit(1)
+
+current = None
+
+print("Key:", pkey)
+print("Cyberprobe configuration:", cyberprobe)
+
+def get_creds():
+
+     res = requests.get(url, verify=client_verify)
+     ret = res.json()
+
+     p12 = base64.b64decode(ret["p12"])
+     p12 = crypto.load_pkcs12(p12, ret["password"])
+
+     cert =  p12.get_certificate()
+     key =  p12.get_privatekey()
+     ca =  p12.get_ca_certificates()
+     host = ret["host"]
+     port = ret["port"]
+
+     return cert, key, ca, host, port
+
+def write_cert(file, cert):
+     cert = crypto.dump_certificate(crypto.FILETYPE_PEM, cert)
+     open(file, "wb").write(cert)
+
+def write_ca(file, ca):
+     ca = [crypto.dump_certificate(crypto.FILETYPE_PEM, v) for v in ca]
+     with open(file, "wb") as f:
+          for v in ca:
+               f.write(v)
+
+def write_key(file, key):
+     key = crypto.dump_privatekey(crypto.FILETYPE_PEM, key)
+     open(file, "wb").write(key)
+
+def update_configuration(update):
+
+     while True:
+
+          # XML parse cyberprobe file
+          try:
+               doc = xml.dom.minidom.parse(cyberprobe)
+               break
+          except Exception as e:
+               print("Parsing", cyberprobe, "failed, will retry...")
+               time.sleep(1)
+               continue
+
+     write_cert("cert.probe", update[0])
+     write_key("key.probe", update[1])
+     write_ca("cert.ca", update[2])
+     host = update[3]
+     port = update[4]
+
+     # Get <targets> element.
+     node = doc.documentElement.getElementsByTagName("endpoints")[0]
+
+     # Delete children.
+     while node.hasChildNodes():
+          node.removeChild(node.firstChild)
+               
+     # Add newline after <targets>
+     node.appendChild(doc.createTextNode("\n"))
+
+     # Re-indent the <endpoint> inline properly.
+     node.appendChild(doc.createTextNode("    "))
+
+     # Add <endpoint ...> element
+     ep = doc.createElement("endpoint")
+     ep.setAttribute("type", "etsi")
+     ep.setAttribute("transport", "tls")
+     ep.setAttribute("certificate", "cert.probe")
+     ep.setAttribute("key", "key.probe")
+     ep.setAttribute("trusted-ca", "cert.ca")
+     ep.setAttribute("host", host)
+     ep.setAttribute("port", str(port))
+     node.appendChild(ep)
+
+     # Add newline after <targets>
+     node.appendChild(doc.createTextNode("\n"))
+
+     # Re-indent the </endpoints> inline properly.
+     node.appendChild(doc.createTextNode("  "))
+
+     # Write XML back to config file.
+     open(cyberprobe, "w").write(doc.toxml())
+
+print("Running.")
+
+# Loop forever.
+while True:
+
+     # Get time of last update
+     try:
+
+          update = get_creds()
+
+          cert = update[0]
+          subject = cert.get_subject()
+          end = cert.get_notAfter()
+
+          if end != current:
+               print("New configuration, updating...")
+               print("Cert CN:", subject.commonName)
+               print("Cert email:", subject.emailAddress)
+               current = end
+               update_configuration(update)
+               print("New configuration installed.")
+
+          time.sleep(15)
+          continue
+
+     except Exception as e:
+          print("Exception:", e)
+          time.sleep(1)
+

@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 
-import requests
-import base64
 ############################################################################
 # 
 # cyberprobe-configure: Automatically configures cyberprobe TLS deliver
@@ -28,6 +26,8 @@ import base64
 # 
 ############################################################################
 
+import requests
+import base64
 from OpenSSL import crypto
 import xml.dom.minidom
 import sys

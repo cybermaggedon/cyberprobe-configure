@@ -2,154 +2,232 @@
 
 import requests
 import base64
+############################################################################
+# 
+# cyberprobe-configure: Automatically configures cyberprobe TLS deliver
+# and endpoint configuration from a configuration service.
+# 
+# Usage:
+#   cyberprobe-configure [<config>]
+# 
+# reads a config file specified (default is /etc/cyberprobe-configure) for
+# configuration settings. The file is a JSON file, an object with the
+# following keys:
+# 
+# key: Secret key: Can be a literal string, a filename, or if it begins with
+# $ specifies an environment variable containing a literal key or file.
+# 
+# configfile: Configuration file to edit.
+# 
+# creds_dir: Directory, where credentials (certs and keys) are written.
+# 
+# url: URL endpoint of the configuration service.
+# 
+# client_verify: Can be false, true (default) or the name of a file containing
+# trusted CA certificates.
+# 
+############################################################################
+
 from OpenSSL import crypto
 import xml.dom.minidom
 import sys
 import time
 import json
+import os
 
+# FIXME: Race condition on file being changed by someone else?
+
+# Get name of configuration from first argument, if present.
 if len(sys.argv) > 1:
     configfile = sys.argv[1]
 else:
-    configfile = "/etc/cyberprobe/cyberprobe-configure.cfg"
+    configfile = "/etc/cyberprobe-configure.cfg"
 
+# Parse configuration file
 try:
-     with open(configfile, "r") as f:
-          config = json.loads(f.read())
-     pkey = config["key"]
 
-     # pkey may be a file or a literal key string.  Work it out...
-     try:
-         file = pkey
-         pkey = open(file).read().strip()
-         print("Key read from file", file)
+    # Open and parse JSON
+    with open(configfile, "r") as f:
+        config = json.loads(f.read())
 
-     except:
-         pass
+    # Get secret key
+    pkey = config["key"]
+    if pkey[0] == '$':
+        pkey = os.getenv(pkey[1:])
+        if pkey == None:
+            raise RuntimeError("The key environment variable is not defined.")
 
-     cyberprobe = config["configfile"]
-     url = config["url"] + pkey
-     try:
-          client_verify = config["client_verify"]
-     except:
-          client_verify = True
+    # pkey may be a file or a literal key string.  Work it out...
+    try:
+        file = pkey
+        pkey = open(file).read().strip()
+        print("Key read from file", file)
+
+    except:
+        pass
+
+    # Get name of cyberprobe configuration file to modify.
+    cyberprobe = config["configfile"]
+    if cyberprobe[0] == '$':
+        cyberprobe = os.getenv(cyberprobe[1:])
+        if cyberprobe == None:
+            raise RuntimeError("The cyberprobe variable is not defined.")
+
+    # Credentials directory
+    creds_dir = config["creds_dir"]
+    if creds_dir[0] == '$':
+        creds_dir = os.getenv(creds_dir[1:])
+        if creds_dir == None:
+            raise RuntimeError("The creds_dir variable is not defined.")
+
+    # Remote configuration URL
+    url = config["url"] + pkey
+    if url[0] == '$':
+        url = os.getenv(url[1:])
+        if url == None:
+            raise RuntimeError("The url environment variable is not defined.")
+
+    # Client verification, default is true.
+    try:
+        client_verify = config["client_verify"]
+    except:
+        client_verify = True
+
 except Exception as e:
-     print("Reading config %s: %s", configfile, e)
-     sys.exit(1)
+    print("Reading config %s: %s" % (configfile, e))
+    sys.exit(1)
 
+# Current credential's end time, this is used to detect when credentials
+# channge
 current = None
 
+# Dump out configuration information.
 print("Key:", pkey)
 print("Cyberprobe configuration:", cyberprobe)
+print("Creds dir:", creds_dir)
 
+# Fetches credentials.
 def get_creds():
 
-     res = requests.get(url, verify=client_verify)
-     ret = res.json()
+    # Fetch payload, and parse for JSON.
+    res = requests.get(url, verify=client_verify)
+    ret = res.json()
 
-     p12 = base64.b64decode(ret["p12"])
-     p12 = crypto.load_pkcs12(p12, ret["password"])
+    # Decode Base64 and PKCS#12.
+    p12 = base64.b64decode(ret["p12"])
+    p12 = crypto.load_pkcs12(p12, ret["password"])
 
-     cert =  p12.get_certificate()
-     key =  p12.get_privatekey()
-     ca =  p12.get_ca_certificates()
-     host = ret["host"]
-     port = ret["port"]
+    cert =  p12.get_certificate()
 
-     return cert, key, ca, host, port
+    # Return decoded contents.
+    key =  p12.get_privatekey()
+    ca =  p12.get_ca_certificates()
+    host = ret["host"]
+    port = ret["port"]
+    return cert, key, ca, host, port
 
+# Write certificate to a file
 def write_cert(file, cert):
-     cert = crypto.dump_certificate(crypto.FILETYPE_PEM, cert)
-     open(file, "wb").write(cert)
+    cert = crypto.dump_certificate(crypto.FILETYPE_PEM, cert)
+    open(file, "wb").write(cert)
 
+# Write CA cert bundle to a file.
 def write_ca(file, ca):
-     ca = [crypto.dump_certificate(crypto.FILETYPE_PEM, v) for v in ca]
-     with open(file, "wb") as f:
-          for v in ca:
-               f.write(v)
+    ca = [crypto.dump_certificate(crypto.FILETYPE_PEM, v) for v in ca]
+    with open(file, "wb") as f:
+        for v in ca:
+            f.write(v)
 
+# Write key to a file.
 def write_key(file, key):
-     key = crypto.dump_privatekey(crypto.FILETYPE_PEM, key)
-     open(file, "wb").write(key)
+    key = crypto.dump_privatekey(crypto.FILETYPE_PEM, key)
+    open(file, "wb").write(key)
 
+# Update cyberprobe configuration
 def update_configuration(update):
 
-     while True:
+    # Write creds to the creds directory.
+    write_cert(creds_dir + "/cert.probe", update[0])
+    write_key(creds_dir + "/key.probe", update[1])
+    write_ca(creds_dir + "/cert.ca", update[2])
+    host = update[3]
+    port = update[4]
 
-          # XML parse cyberprobe file
-          try:
-               doc = xml.dom.minidom.parse(cyberprobe)
-               break
-          except Exception as e:
-               print("Parsing", cyberprobe, "failed, will retry...")
-               time.sleep(1)
-               continue
+    # Loop until cyberprobe is parsed successfully.
+    while True:
 
-     write_cert("cert.probe", update[0])
-     write_key("key.probe", update[1])
-     write_ca("cert.ca", update[2])
-     host = update[3]
-     port = update[4]
+        # XML parse cyberprobe file
+        try:
+            doc = xml.dom.minidom.parse(cyberprobe)
+            break
+        except Exception as e:
+            print("Parsing", cyberprobe, "failed, will retry...")
+            time.sleep(1)
+            continue
 
-     # Get <targets> element.
-     node = doc.documentElement.getElementsByTagName("endpoints")[0]
+    # Get <targets> element.
+    node = doc.documentElement.getElementsByTagName("endpoints")[0]
 
-     # Delete children.
-     while node.hasChildNodes():
-          node.removeChild(node.firstChild)
+    # Delete children.
+    while node.hasChildNodes():
+        node.removeChild(node.firstChild)
                
-     # Add newline after <targets>
-     node.appendChild(doc.createTextNode("\n"))
+    # Add newline after <targets>
+    node.appendChild(doc.createTextNode("\n"))
 
-     # Re-indent the <endpoint> inline properly.
-     node.appendChild(doc.createTextNode("    "))
+    # Re-indent the <endpoint> inline properly.
+    node.appendChild(doc.createTextNode("    "))
 
-     # Add <endpoint ...> element
-     ep = doc.createElement("endpoint")
-     ep.setAttribute("type", "etsi")
-     ep.setAttribute("transport", "tls")
-     ep.setAttribute("certificate", "cert.probe")
-     ep.setAttribute("key", "key.probe")
-     ep.setAttribute("trusted-ca", "cert.ca")
-     ep.setAttribute("host", host)
-     ep.setAttribute("port", str(port))
-     node.appendChild(ep)
+    # Add <endpoint ...> element
+    ep = doc.createElement("endpoint")
+    ep.setAttribute("type", "etsi")
+    ep.setAttribute("transport", "tls")
+    ep.setAttribute("certificate", creds_dir + "/cert.probe")
+    ep.setAttribute("key", creds_dir + "/key.probe")
+    ep.setAttribute("trusted-ca", creds_dir + "/cert.ca")
+    ep.setAttribute("host", host)
+    ep.setAttribute("port", str(port))
+    node.appendChild(ep)
 
-     # Add newline after <targets>
-     node.appendChild(doc.createTextNode("\n"))
+    # Add newline after <targets>
+    node.appendChild(doc.createTextNode("\n"))
 
-     # Re-indent the </endpoints> inline properly.
-     node.appendChild(doc.createTextNode("  "))
+    # Re-indent the </endpoints> inline properly.
+    node.appendChild(doc.createTextNode("  "))
 
-     # Write XML back to config file.
-     open(cyberprobe, "w").write(doc.toxml())
+    # Write XML back to config file.
+    open(cyberprobe, "w").write(doc.toxml())
 
 print("Running.")
 
 # Loop forever.
 while True:
 
-     # Get time of last update
-     try:
+    # Get time of last update
+    try:
 
-          update = get_creds()
+        # Get creds
+        update = get_creds()
 
-          cert = update[0]
-          subject = cert.get_subject()
-          end = cert.get_notAfter()
+        # Extract some information
+        cert = update[0]
+        subject = cert.get_subject()
+        end = cert.get_notAfter()
 
-          if end != current:
-               print("New configuration, updating...")
-               print("Cert CN:", subject.commonName)
-               print("Cert email:", subject.emailAddress)
-               current = end
-               update_configuration(update)
-               print("New configuration installed.")
+        # If cert changed, update.
+        if end != current:
+            print("New configuration, updating...")
+            print("Cert CN:", subject.commonName)
+            print("Cert email:", subject.emailAddress)
+            current = end
+            update_configuration(update)
+            print("New configuration installed.")
 
-          time.sleep(15)
-          continue
+        # Loop again in a minute.
+        time.sleep(60)
+        continue
 
-     except Exception as e:
-          print("Exception:", e)
-          time.sleep(1)
+    except Exception as e:
+        print("Exception:", e)
+        time.sleep(1)
 

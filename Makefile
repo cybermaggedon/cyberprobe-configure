@@ -11,7 +11,7 @@ deps: wheels
 wheels: Makefile
 	-rm -rf wheels wheels.tmp
 	mkdir wheels.tmp
-	(cd wheels.tmp; pip3 wheel requests)
+	(cd wheels.tmp; pip3 wheel requests PyOpenSSL)
 	mv wheels.tmp wheels
 
 container:

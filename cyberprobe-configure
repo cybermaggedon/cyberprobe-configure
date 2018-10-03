@@ -185,7 +185,7 @@ def update_configuration(update):
     ep.setAttribute("certificate", creds_dir + "/cert.probe")
     ep.setAttribute("key", creds_dir + "/key.probe")
     ep.setAttribute("trusted-ca", creds_dir + "/cert.ca")
-    ep.setAttribute("host", host)
+    ep.setAttribute("hostname", host)
     ep.setAttribute("port", str(port))
     node.appendChild(ep)
 
